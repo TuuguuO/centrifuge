@@ -1,0 +1,403 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <Keypad.h>
+#include <EEPROM.h>
+
+// ---------------- OLED (Page Buffer) ----------------
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(
+  U8G2_R0,
+  U8X8_PIN_NONE
+);
+
+// ---------------- CONTROL OUTPUT ----------------
+const uint8_t PWM_OUT_PIN = 11;
+
+// ---------------- RPM INPUT ----------------
+const uint8_t RPM_PIN = 12;
+const uint8_t PULSES_PER_REV = 9;
+
+volatile uint32_t pulseCount = 0;
+uint32_t lastCalcMs = 0;
+uint32_t lastPulseCount = 0;
+
+float rpmRaw = 0;
+float rpmFiltered = 0;
+
+// ---------------- KEYPAD ----------------
+const byte ROWS = 4, COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte rowPins[ROWS] = {2,3,4,5};
+byte colPins[COLS] = {6,7,8,9};
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ---------------- STATES ----------------
+enum UiState { UI_HOME, UI_SET_RPM, UI_SET_TIME, UI_RUNNING };
+UiState uiState = UI_HOME;
+
+bool running = false;
+bool pidEnabled = false;
+
+uint16_t setRpm = 2000;
+uint16_t setTimeSec = 0;
+uint32_t runStartMs = 0;
+
+// PID parameters
+float Kp = 0.08;
+float Ki = 0.015;
+float Kd = 0.00;
+float pidIntegral = 0;
+float lastError = 0;
+
+uint8_t lastPwm = 0;
+uint8_t softPwm = 0;
+
+char inputBuf[6] = "";
+uint8_t inputLen = 0;
+
+const float MAX_RPM = 5400.0f;
+uint8_t animPhase = 0;
+
+// ---------------- INPUT BUFFER ----------------
+void inputClear(){ inputLen = 0; inputBuf[0] = '\0'; }
+void inputAdd(char k){ if(inputLen<5){ inputBuf[inputLen++]=k; inputBuf[inputLen]='\0'; }}
+uint16_t inputVal(){ return atoi(inputBuf); }
+
+// ---------------- PWM ----------------
+void writePWM(uint8_t v){ lastPwm = v; analogWrite(PWM_OUT_PIN, v); }
+
+// ---------------- SOFT START ----------------
+uint8_t softStepTo(uint8_t t){
+  if(softPwm < t) softPwm++;
+  else if(softPwm > t) softPwm--;
+  return softPwm;
+}
+
+// ---------------- RPM INTERRUPT ----------------
+ISR(PCINT0_vect){
+  static uint8_t last = HIGH;
+  uint8_t s = (PINB & (1<<PB4)) ? HIGH : LOW;
+  if(last == HIGH && s == LOW) pulseCount++;
+  last = s;
+}
+
+// ---------------- RPM UPDATE ----------------
+void updateRPM(){
+  uint32_t now = millis();
+  if(now - lastCalcMs < 100) return;
+  lastCalcMs = now;
+
+  noInterrupts();
+  uint32_t pc = pulseCount;
+  interrupts();
+
+  uint32_t delta = pc - lastPulseCount;
+  lastPulseCount = pc;
+
+  rpmRaw = delta * 600.0f / PULSES_PER_REV;
+  rpmFiltered = rpmFiltered*0.7 + rpmRaw*0.3;
+}
+
+// ---------------- MOTOR CONTROL ----------------
+uint8_t controlMotor(){
+  float threshold = setRpm * 0.75;
+
+  // OPEN LOOP PHASE
+  if(!pidEnabled){
+    uint8_t basePWM = (setRpm / MAX_RPM) * 255.0;
+    uint8_t sm = softStepTo(basePWM);
+
+    if(rpmFiltered >= threshold){
+      pidEnabled = true;
+      pidIntegral = 0;
+      lastError = 0;
+    }
+    return sm;
+  }
+
+  // PID PHASE
+  float error = (float)setRpm - rpmFiltered;
+  pidIntegral += error * 0.1;
+  float derivative = (error - lastError)/0.1;
+  lastError = error;
+
+  float out = Kp*error + Ki*pidIntegral + Kd*derivative;
+  if(out < 0) out=0;
+  if(out > 255) out=255;
+
+  return (uint8_t)out;
+}
+
+// ---------------- TIME ----------------
+void getTime(uint16_t &mm, uint8_t &ss){
+  uint32_t rem = 0;
+  if(running && setTimeSec>0){
+    rem = setTimeSec - ((millis() - runStartMs)/1000);
+    if((int32_t)rem < 0) rem = 0;
+  } else rem = setTimeSec;
+
+  mm = rem/60;
+  ss = rem%60;
+}
+
+// ---------------- UI HELPERS ----------------
+void smallText(const char* s,int x,int y){
+  u8g2.setFont(u8g2_font_6x12_tr);
+  u8g2.drawStr(x,y,s);
+}
+
+void centerTitle(const char* s){
+  u8g2.setFont(u8g2_font_6x12_tr);
+  uint8_t w=u8g2.getStrWidth(s);
+  u8g2.drawStr((128-w)/2,10,s);
+}
+
+void bigNum(const char* s){
+  u8g2.setFont(u8g2_font_logisoso24_tn);
+  uint8_t w=u8g2.getStrWidth(s);
+  u8g2.drawStr((128-w)/2,60,s);
+}
+
+// ---------------- HOME ----------------
+void drawHome(){
+  u8g2.firstPage();
+  do{
+    centerTitle("CENTRIFUGE PRO");
+    u8g2.drawHLine(0,14,128);
+
+    char b[24];
+    sprintf(b,"SET: %4u RPM", setRpm);
+    smallText(b,0,28);
+
+    uint16_t mm; uint8_t ss;
+    getTime(mm,ss);
+    sprintf(b,"TIME: %02u:%02u", mm, ss);
+    smallText(b,0,40);
+
+    smallText("A:RPM B:TIME C:START",0,62);
+
+  } while(u8g2.nextPage());
+}
+
+// ---------------- SET RPM ----------------
+void drawSetRpm(){
+  u8g2.firstPage();
+  do{
+    centerTitle("SET TARGET RPM");
+    u8g2.drawHLine(0,14,128);
+
+    const char* s = (inputBuf[0]?inputBuf:"_");
+    int boxW = 60, boxH = 20;
+    int boxX = (128-boxW)/2, boxY = 24;
+    u8g2.drawFrame(boxX, boxY, boxW, boxH);
+
+    u8g2.setFont(u8g2_font_logisoso24_tn);
+    uint8_t w=u8g2.getStrWidth(s);
+    u8g2.drawStr((128-w)/2, boxY+boxH-2, s);
+
+    smallText("#:OK     *:CLEAR",10,62);
+
+  } while(u8g2.nextPage());
+}
+
+// ---------------- SET TIME ----------------
+void drawSetTime(){
+  u8g2.firstPage();
+  do{
+    centerTitle("SET TIME (SEC)");
+    u8g2.drawHLine(0,14,128);
+
+    const char* s = (inputBuf[0]?inputBuf:"_");
+    int boxW = 60, boxH = 20;
+    int boxX = (128-boxW)/2, boxY = 24;
+    u8g2.drawFrame(boxX, boxY, boxW, boxH);
+
+    u8g2.setFont(u8g2_font_logisoso24_tn);
+    uint8_t w=u8g2.getStrWidth(s);
+    u8g2.drawStr((128-w)/2, boxY+boxH-2, s);
+
+    smallText("#:OK     *:CLEAR",10,62);
+
+  } while(u8g2.nextPage());
+}
+
+// ---------------- RUNNING (NO BAR, INVERT TIMER BOX) ----------------
+void drawRunning(){
+  u8g2.firstPage();
+  do{
+    // Title
+    centerTitle("RUNNING");
+
+    // Spinner
+    uint8_t cx=118, cy=8;
+    switch(animPhase){
+      case 0: u8g2.drawDisc(cx-4,cy,2); break;
+      case 1: u8g2.drawDisc(cx,cy-4,2); break;
+      case 2: u8g2.drawDisc(cx+4,cy,2); break;
+      case 3: u8g2.drawDisc(cx,cy+4,2); break;
+    }
+    animPhase = (animPhase+1)&3;
+
+    u8g2.drawHLine(0,14,128);
+
+    // RPM info
+    char b[24];
+    sprintf(b,"RPM: %4u",(uint16_t)rpmFiltered);
+    smallText(b,2,28);
+
+    sprintf(b,"SET: %4u",setRpm);
+    smallText(b,70,28);
+
+    // TIMER BOX (INVERT STYLE)
+    uint16_t mm; uint8_t ss;
+    getTime(mm, ss);
+
+    char tbuf[10];
+    sprintf(tbuf,"%02u:%02u",mm,ss);
+
+    int boxW = 122;
+    int boxH = 30;
+    int boxX = 3;       // centered
+    int boxY = 30;
+
+    // White frame
+    u8g2.drawFrame(boxX, boxY, boxW, boxH);
+
+    // Fill with BLACK
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(boxX+1, boxY+1, boxW-2, boxH-2);
+
+    // Draw white text
+    u8g2.setDrawColor(1);
+    u8g2.setFont(u8g2_font_logisoso24_tn);
+    uint8_t tw=u8g2.getStrWidth(tbuf);
+    u8g2.drawStr((128-tw)/2, boxY+boxH-3, tbuf);
+
+    // Return draw color to normal
+    u8g2.setDrawColor(1);
+
+  } while(u8g2.nextPage());
+}
+
+// ---------------- UI ROUTER ----------------
+void drawScreen(){
+  switch(uiState){
+    case UI_HOME:    drawHome(); break;
+    case UI_SET_RPM: drawSetRpm(); break;
+    case UI_SET_TIME:drawSetTime(); break;
+    case UI_RUNNING: drawRunning(); break;
+  }
+}
+
+// ---------------- KEYPAD ----------------
+void handleKey(char key){
+  if(!key) return;
+
+  switch(uiState){
+
+    case UI_HOME:
+      if(key=='A'){ uiState=UI_SET_RPM; inputClear(); }
+      else if(key=='B'){ uiState=UI_SET_TIME; inputClear(); }
+      else if(key=='C'){
+        running=true;
+        pidEnabled=false;
+        softPwm=lastPwm;
+        pidIntegral=0;
+        lastError=0;
+        runStartMs=millis();
+        uiState=UI_RUNNING;
+      }
+      break;
+
+    case UI_SET_RPM:
+      if(key>='0' && key<='9') inputAdd(key);
+      else if(key=='*') inputClear();
+      else if(key=='#'){
+        if(inputLen>0){
+          setRpm = inputVal();
+          if(setRpm > MAX_RPM) setRpm = MAX_RPM;
+          EEPROM.put(0,setRpm);
+        }
+        uiState = UI_HOME;
+      }
+      break;
+
+    case UI_SET_TIME:
+      if(key>='0' && key<='9') inputAdd(key);
+      else if(key=='*') inputClear();
+      else if(key=='#'){
+        if(inputLen>0){
+          setTimeSec = inputVal();
+          EEPROM.put(10,setTimeSec);
+        }
+        uiState = UI_HOME;
+      }
+      break;
+
+    case UI_RUNNING:
+      if(key=='C'){
+        running=false;
+        uiState=UI_HOME;
+      }
+      break;
+  }
+}
+
+// ---------------- SETUP ----------------
+void setup(){
+  pinMode(PWM_OUT_PIN,OUTPUT);
+  analogWrite(PWM_OUT_PIN,0);
+
+  pinMode(RPM_PIN,INPUT_PULLUP);
+  PCICR |= (1<<PCIE0);
+  PCMSK0 |= (1<<PCINT4);
+
+  Wire.begin();
+  u8g2.begin();
+
+  EEPROM.get(0,setRpm);
+  EEPROM.get(10,setTimeSec);
+
+  if(setRpm==0 || setRpm>MAX_RPM) setRpm=2000;
+  if(setTimeSec>3600) setTimeSec=0;
+
+  u8g2.firstPage();
+  do{
+    centerTitle("CENTRIFUGE PRO");
+    smallText("Hybrid Control v5.2",10,40);
+  }while(u8g2.nextPage());
+
+  delay(800);
+  lastCalcMs=millis();
+}
+
+// ---------------- LOOP ----------------
+void loop(){
+  char key = keypad.getKey();
+  if(key) handleKey(key);
+
+  updateRPM();
+
+  if(running){
+    uint8_t pwm = controlMotor();
+    writePWM(pwm);
+
+    if(setTimeSec>0){
+      uint32_t el = (millis() - runStartMs)/1000;
+      if(el >= setTimeSec){
+        running=false;
+        uiState=UI_HOME;
+      }
+    }
+  } else {
+    writePWM(softStepTo(0));
+  }
+
+  drawScreen();
+}
